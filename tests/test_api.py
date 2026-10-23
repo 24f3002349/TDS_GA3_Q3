@@ -101,7 +101,7 @@ def main():
         client = TestClient(api.app)
         model_calls = {"count": 0}
 
-        def fake_decide_batch(dossiers):
+        def fake_decide_batch(dossiers, budget_seconds=None):
             model_calls["count"] += 1
             return [
                 {
