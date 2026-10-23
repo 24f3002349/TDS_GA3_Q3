@@ -9,3 +9,6 @@ core.py.bak
 
 *.py[cod]
 core.py.bak
+
+# Grader request captures (synthetic exam data, may contain canaries)
+captures/
