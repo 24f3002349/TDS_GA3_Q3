@@ -110,7 +110,7 @@ def main():
                     "target": None,
                     "payload": {
                         "reasonCode": "INFORMATIONAL",
-                        "referenceId": "REF-1",
+                        "referenceId": dossier["dossierId"],
                     },
                     "evidence": ["line-1"],
                 }

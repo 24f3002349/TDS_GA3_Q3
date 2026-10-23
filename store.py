@@ -1,4 +1,5 @@
 ﻿import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -6,7 +7,12 @@ from typing import Any
 
 from core import canonical_json
 
-DEFAULT_DB = Path(__file__).resolve().parent / "mailroom.db"
+# Point MAILROOM_DB_PATH at a persistent disk (e.g. a Render disk mount)
+# so the decision cache survives restarts and redeploys.
+DEFAULT_DB = Path(
+    os.getenv("MAILROOM_DB_PATH")
+    or Path(__file__).resolve().parent / "mailroom.db"
+)
 
 
 class MailroomStore:

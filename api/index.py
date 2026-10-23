@@ -176,9 +176,22 @@ FIRST_PASS_SECONDS = 30
 RETRY_MIN_REMAINING_SECONDS = 12
 REQUEST_BUDGET_SECONDS = 43
 
-# Serialize model work so concurrent evaluations sharing the same core
-# dossiers reuse one set of cached decisions instead of paying twice.
-decision_lock = threading.Lock()
+# Model-chosen argument values that must be copied from the dossier:
+# (target id must be grounded?, payload fields that must be grounded).
+GROUNDED_FIELDS = {
+    "create_draft": (False, ("recipient", "referenceId", "status")),
+    "update_internal_record": (True, ("sourceEventId", "value")),
+    "send_approved_notice": (True, ("referenceId", "status")),
+    "request_confirmation": (True, ("claimedSender", "referenceId")),
+    "quarantine_item": (False, ("artifactId",)),
+    "no_action": (False, ("referenceId",)),
+}
+
+# Dossiers currently being decided, by content fingerprint. A concurrent
+# evaluation containing the same dossier waits for that result instead of
+# paying for a second model call; different dossiers proceed in parallel.
+inflight_lock = threading.Lock()
+inflight = {}
 
 
 def make_proposal(dossier, decision):
@@ -190,6 +203,54 @@ def make_proposal(dossier, decision):
         "payload": decision["payload"],
         "evidence": decision["evidence"],
     }
+
+
+def draft_queue_id(dossier):
+    mailbox = dossier["mailbox"]
+    return mailbox if mailbox.startswith("mailbox:") else "mailbox:" + mailbox
+
+
+def dossier_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from dossier_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from dossier_strings(item)
+
+
+def check_grounded(decision, dossier):
+    """Reject argument values the model did not copy from the dossier.
+
+    This blocks invented recipients, IDs, and statuses. Outbound sends are
+    held to a stricter rule: every argument must appear in a cited line.
+    """
+    action = decision["action"]
+    target_grounded, payload_fields = GROUNDED_FIELDS[action]
+    values = [decision["payload"][field] for field in payload_fields]
+    if target_grounded:
+        values.append(decision["target"]["id"])
+
+    if action == "create_draft":
+        if decision["target"]["id"] != draft_queue_id(dossier):
+            raise ValueError("Draft queue does not match the dossier mailbox")
+
+    if action == "send_approved_notice":
+        cited = set(decision["evidence"])
+        texts = [
+            line["text"]
+            for source in dossier["sources"]
+            for line in source["lines"]
+            if line["lineId"] in cited
+        ]
+    else:
+        texts = list(dossier_strings(dossier))
+
+    for value in values:
+        if not any(value in text for text in texts):
+            raise ValueError("Argument value is not grounded in the dossier")
 
 
 def accept_decisions(generated, pending):
@@ -213,6 +274,7 @@ def accept_decisions(generated, pending):
         decision = {field: item[field] for field in DECISION_FIELDS}
         try:
             validate_proposal(make_proposal(dossier, decision), dossier)
+            check_grounded(decision, dossier)
         except (ValueError, TypeError, KeyError, AttributeError):
             continue
 
@@ -254,11 +316,15 @@ def fallback_decision(dossier):
     }
 
 
+def remaining_budget(started):
+    return REQUEST_BUDGET_SECONDS - (time.monotonic() - started)
+
+
 def generate_decisions(missing, started):
     pending = {d["dossierId"]: d for d in missing}
     decisions = {}
 
-    budget = FIRST_PASS_SECONDS
+    budget = min(FIRST_PASS_SECONDS, remaining_budget(started))
 
     for _ in range(2):
         if not pending:
@@ -270,11 +336,33 @@ def generate_decisions(missing, started):
         for dossier_id in decided:
             del pending[dossier_id]
 
-        budget = REQUEST_BUDGET_SECONDS - (time.monotonic() - started)
+        budget = remaining_budget(started)
         if budget < RETRY_MIN_REMAINING_SECONDS:
             break
 
     return decisions, pending
+
+
+def claim_dossiers(dossiers, fingerprints):
+    """Split dossiers into cached, to-decide-here, and decided-elsewhere."""
+    decisions = {}
+    mine = []
+    waiting = []
+
+    with inflight_lock:
+        for dossier in dossiers:
+            fingerprint = fingerprints[dossier["dossierId"]]
+            cached = store.get_cached_decision(fingerprint)
+
+            if cached is not None:
+                decisions[dossier["dossierId"]] = cached
+            elif fingerprint in inflight:
+                waiting.append((dossier, inflight[fingerprint]))
+            else:
+                inflight[fingerprint] = threading.Event()
+                mine.append(dossier)
+
+    return decisions, mine, waiting
 
 
 def build_proposals(dossiers):
@@ -284,23 +372,13 @@ def build_proposals(dossiers):
         for dossier in dossiers
     }
 
-    with decision_lock:
-        decisions = {}
-        missing = []
+    decisions, mine, waiting = claim_dossiers(dossiers, fingerprints)
+    undecided = {}
 
-        for dossier in dossiers:
-            fingerprint = fingerprints[dossier["dossierId"]]
-            cached = store.get_cached_decision(fingerprint)
-
-            if cached is None:
-                missing.append(dossier)
-            else:
-                decisions[dossier["dossierId"]] = cached
-
-        undecided = {}
-        if missing:
+    try:
+        if mine:
             try:
-                generated, undecided = generate_decisions(missing, started)
+                generated, undecided = generate_decisions(mine, started)
             except ModelConfigError as exc:
                 raise RuntimeError(str(exc)) from exc
 
@@ -308,18 +386,30 @@ def build_proposals(dossiers):
             for dossier_id, decision in generated.items():
                 store.cache_decision(fingerprints[dossier_id], decision)
             decisions.update(generated)
+    finally:
+        with inflight_lock:
+            for dossier in mine:
+                inflight.pop(fingerprints[dossier["dossierId"]]).set()
 
-        if undecided:
-            print(
-                f"[propose] {len(undecided)} of {len(dossiers)} dossiers "
-                "used the safe fallback",
-                file=sys.stderr,
-                flush=True,
-            )
-            if len(undecided) == len(dossiers):
-                raise RuntimeError("Decision model unavailable")
-            for dossier_id, dossier in undecided.items():
-                decisions[dossier_id] = fallback_decision(dossier)
+    for dossier, event in waiting:
+        event.wait(max(0.0, remaining_budget(started)))
+        cached = store.get_cached_decision(fingerprints[dossier["dossierId"]])
+        if cached is None:
+            undecided[dossier["dossierId"]] = dossier
+        else:
+            decisions[dossier["dossierId"]] = cached
+
+    if undecided:
+        print(
+            f"[propose] {len(undecided)} of {len(dossiers)} dossiers "
+            "used the safe fallback",
+            file=sys.stderr,
+            flush=True,
+        )
+        if len(undecided) == len(dossiers):
+            raise RuntimeError("Decision model unavailable")
+        for dossier_id, dossier in undecided.items():
+            decisions[dossier_id] = fallback_decision(dossier)
 
     proposals = []
 
@@ -338,12 +428,13 @@ def build_proposals(dossiers):
     return proposals
 
 
-@app.get("/healthz")
+# HEAD is allowed so Render's port and health probes get 200, not 405.
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 def healthz():
     return {"status": "ok"}
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
         "service": PROFILE,
@@ -524,7 +615,8 @@ def handle_commit_data(data):
 async def handle_propose(request: Request):
     content_type = request.headers.get("content-type", "")
     if not content_type.lower().startswith("application/json"):
-        return error_response(415, "Content-Type must be application/json")
+        # The contract asks for 400/422 on malformed requests.
+        return error_response(400, "Content-Type must be application/json")
 
     body = await request.body()
     if len(body) > MAX_REQUEST_BYTES:
