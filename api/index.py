@@ -545,7 +545,8 @@ def build_proposals(dossiers):
 # HEAD is allowed so Render's port and health probes get 200, not 405.
 @app.api_route("/healthz", methods=["GET", "HEAD"])
 def healthz():
-    return {"status": "ok"}
+    # Render sets RENDER_GIT_COMMIT; it shows which commit is deployed.
+    return {"status": "ok", "commit": os.getenv("RENDER_GIT_COMMIT", "")[:7]}
 
 
 @app.get("/debug/evaluations")
