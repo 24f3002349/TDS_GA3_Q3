@@ -52,11 +52,17 @@ def verify_receipt_signature(
 
     try:
         public_key_bytes = decode_base64url(public_key_jwk["x"])
-        signature = base64.b64decode(
-            receipt["receiptSignature"],
-            altchars=b"-_",
-            validate=True,
-        )
+        encoded_signature = receipt["receiptSignature"]
+        if not isinstance(encoded_signature, str):
+            return False
+
+        signature = base64.b64decode(encoded_signature, validate=True)
+
+        # Accept only the canonical standard-base64 spelling. Otherwise a
+        # modified signature string (url-safe alphabet, altered padding
+        # bits) could decode to the same bytes and still verify.
+        if base64.b64encode(signature).decode("ascii") != encoded_signature:
+            return False
 
         if len(public_key_bytes) != 32 or len(signature) != 64:
             return False

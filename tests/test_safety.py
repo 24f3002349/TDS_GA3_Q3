@@ -2,6 +2,7 @@
 
 No real Gemini calls are made; decide_batch is faked.
 """
+import os
 import sys
 import tempfile
 import threading
@@ -168,6 +169,45 @@ def main():
         assert first.status_code == second.status_code == 200
         assert first.json()["proposals"] == second.json()["proposals"]
         print("PASS: concurrent evaluations share one model call per dossier")
+
+        # Debug export is invisible unless enabled and the token matches.
+        os.environ.pop("DEBUG_EXPORT_TOKEN", None)
+        assert http.get("/debug/evaluations").status_code == 404
+        os.environ["DEBUG_EXPORT_TOKEN"] = "test-token-123"
+        assert http.get("/debug/evaluations").status_code == 404
+        assert http.get(
+            "/debug/evaluations", headers={"Authorization": "Bearer wrong"}
+        ).status_code == 404
+        exported = http.get(
+            "/debug/evaluations",
+            headers={"Authorization": "Bearer test-token-123"},
+        )
+        assert exported.status_code == 200
+        ids = {e["evaluationId"] for e in exported.json()["evaluations"]}
+        assert ids == {"concurrent-0", "concurrent-1"}
+        os.environ.pop("DEBUG_EXPORT_TOKEN")
+        print("PASS: debug export requires the configured token")
+
+        # A receipt ID recorded by one evaluation cannot be reused by another.
+        api.store.used_receipt_ids = lambda ids: {"reused"}
+        reuse = http.post("/a2a/", json={
+            "profile": "ga5-mailroom-action-gate/v2",
+            "operation": "commit",
+            "evaluationId": "concurrent-0",
+            "inputDigest": results["concurrent-0"].json()["inputDigest"],
+            "receipts": [{
+                "dossierId": "demo-dossier-001",
+                "callId": results["concurrent-0"].json()["proposals"][0]["callId"],
+                "action": "no_action",
+                "accepted": True,
+                "proposalDigest": "0" * 64,
+                "receiptId": "reused",
+                "receiptSignature": "AAAA",
+            }],
+        })
+        assert reuse.status_code == 400, reuse.text
+        assert "already used" in reuse.json()["error"]
+        print("PASS: receiptId reused from another evaluation rejected")
 
         http.close()
 

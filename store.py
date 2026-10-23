@@ -178,6 +178,46 @@ class MailroomStore:
                 (fingerprint, canonical_json(proposal)),
             )
 
+    def used_receipt_ids(self, receipt_ids: list[str]) -> set[str]:
+        """Receipt IDs already recorded by any committed evaluation."""
+        if not receipt_ids:
+            return set()
+        placeholders = ",".join("?" for _ in receipt_ids)
+        with self.connect() as db:
+            rows = db.execute(
+                f"""SELECT json_extract(receipt_json, '$.receiptId') AS rid
+                    FROM receipts
+                    WHERE json_extract(receipt_json, '$.receiptId')
+                          IN ({placeholders})""",
+                list(receipt_ids),
+            ).fetchall()
+            return {row["rid"] for row in rows}
+
+    def export_evaluations(self, limit: int = 4):
+        """Most recent evaluations, for the token-protected debug export."""
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT evaluation_id, request_json, propose_response_json,
+                          status, commit_request_json, commit_response_json
+                   FROM evaluations ORDER BY rowid DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+
+        def load(text):
+            return json.loads(text) if text else None
+
+        return [
+            {
+                "evaluationId": row["evaluation_id"],
+                "status": row["status"],
+                "request": load(row["request_json"]),
+                "proposeResponse": load(row["propose_response_json"]),
+                "commitRequest": load(row["commit_request_json"]),
+                "commitResponse": load(row["commit_response_json"]),
+            }
+            for row in rows
+        ]
+
     def get_cached_commit(self, evaluation_id: str):
         with self.connect() as db:
             row = db.execute(

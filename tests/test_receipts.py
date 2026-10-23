@@ -71,5 +71,27 @@ assert not verify_receipt_signature(
 )
 print("PASS: wrong public key rejected")
 
+good = signed_receipt["receiptSignature"]
+assert "+" in good or "/" in good  # true for almost every 64-byte signature
+urlsafe = good.replace("+", "-").replace("/", "_")
+assert not verify_receipt_signature(
+    evaluation_id, input_digest,
+    {**signed_receipt, "receiptSignature": urlsafe}, jwk,
+)
+assert not verify_receipt_signature(
+    evaluation_id, input_digest,
+    {**signed_receipt, "receiptSignature": good.rstrip("=")}, jwk,
+)
+print("PASS: non-canonical signature encodings rejected")
+
+assert not verify_receipt_signature(
+    "other-evaluation", input_digest, signed_receipt, jwk
+)
+assert not verify_receipt_signature(
+    evaluation_id, input_digest,
+    {**signed_receipt, "dossierId": "demo-002"}, jwk,
+)
+print("PASS: signature bound to its evaluation and receipt")
+
 print("All receipt signature tests passed.")
 

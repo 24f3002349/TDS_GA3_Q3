@@ -1,5 +1,7 @@
 ﻿import base64
+import hmac
 import json
+import os
 import sys
 import threading
 import time
@@ -434,6 +436,23 @@ def healthz():
     return {"status": "ok"}
 
 
+@app.get("/debug/evaluations")
+def debug_evaluations(request: Request):
+    """Export recent stored evaluations for offline analysis.
+
+    Disabled unless DEBUG_EXPORT_TOKEN is set; requires that token as a
+    Bearer header. Looks like a missing route to everyone else.
+    """
+    token = os.getenv("DEBUG_EXPORT_TOKEN", "")
+    supplied = request.headers.get("authorization", "")
+    if not token or not hmac.compare_digest(
+        supplied.encode("utf-8"), f"Bearer {token}".encode("utf-8")
+    ):
+        return error_response(404, "Not Found")
+
+    return {"evaluations": store.export_evaluations()}
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
@@ -542,6 +561,10 @@ def handle_commit_data(data):
 
     if set(receipt_by_id) != set(proposal_by_id):
         return error_response(400, "Missing or unexpected receipt dossierId")
+
+    # A receipt is scoped to one evaluation; never accept a transferred one.
+    if store.used_receipt_ids(list(seen_receipt_ids)):
+        return error_response(400, "receiptId already used by another evaluation")
 
     verifier = json.loads(evaluation["verifier_json"])
     public_key_jwk = verifier["publicKeyJwk"]
