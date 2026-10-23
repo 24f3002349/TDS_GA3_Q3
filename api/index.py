@@ -287,6 +287,11 @@ def check_grounded(decision, dossier):
 # Sources that may supply an argument value when evidence is completed.
 TRUSTED_PROVENANCE = {"authenticated_internal", "signed_internal"}
 NEVER_CITE_KINDS = {"history", "secret"}
+# Payload field whose value the incoming request line must carry.
+REQUEST_LINE_FIELDS = {
+    "create_draft": "referenceId",
+    "request_confirmation": "claimedSender",
+}
 
 
 def complete_evidence(decision, dossier):
@@ -322,6 +327,34 @@ def complete_evidence(decision, dossier):
             best = min(holders, key=lambda h: h[0])[2]
             evidence.append(best["lineId"])
             cited_text.append(best["text"])
+
+    # Drafts and confirmations answer an incoming request, so the request
+    # itself is evidence even when its values also appear in a trusted
+    # record: the external line carrying the order reference (draft) or the
+    # claimed address (confirmation).
+    request_field = REQUEST_LINE_FIELDS.get(decision["action"])
+    if request_field:
+        value = decision["payload"][request_field]
+        requests = [
+            line for source, line in lines
+            if source.get("provenance", "").startswith("external")
+            and source.get("kind") != "attachment"
+            and value in line["text"]
+        ]
+        if requests and not any(line["lineId"] in evidence for line in requests):
+            evidence.append(requests[0]["lineId"])
+
+    # A suppressed item must cite the incoming message being suppressed.
+    # Which line that is needs judgement (decoy messages exist), so a
+    # decision without one is sent back to the model instead of guessed.
+    if decision["action"] == "no_action":
+        external = {
+            line["lineId"] for source, line in lines
+            if source.get("provenance", "").startswith("external")
+            and source.get("kind") != "attachment"
+        }
+        if external and not external & set(evidence):
+            raise ValueError("no_action must cite the incoming message")
 
     return dict(decision, evidence=evidence)
 

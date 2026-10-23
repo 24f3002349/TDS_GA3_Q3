@@ -128,6 +128,26 @@ def main():
     assert set(completed) == {"m2", "o1", "o2"}, completed  # status via o1, recipient via o2
     print("PASS: evidence completed with trusted lines for uncited values")
 
+    # A draft answers a request: the customer's request line (the external
+    # line with the order reference) is added even though the trusted record
+    # also carries that reference.
+    no_request = draft(evidence=["m1", "o1"])
+    completed = api.accept_decisions([no_request], pending)["safety-001"]["evidence"]
+    assert "m2" in completed, completed
+    print("PASS: draft evidence always includes the customer's request line")
+
+    # no_action without the incoming message is sent back to the model.
+    suppress = {
+        "dossierId": "safety-001",
+        "action": "no_action",
+        "target": None,
+        "payload": {"reasonCode": "DUPLICATE", "referenceId": "ORD-77"},
+        "evidence": ["o1"],
+    }
+    assert not accepted(suppress)
+    assert accepted(dict(suppress, evidence=["o1", "m2"]))
+    print("PASS: no_action must cite the incoming message")
+
     # Outbound sends: every argument must be in a cited line.
     assert accepted(notice(["o1", "o2"]))
     assert not accepted(notice(["o2"]))
