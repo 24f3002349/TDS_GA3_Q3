@@ -94,7 +94,7 @@ def main():
             return [
                 decision(d["dossierId"])
                 for d in dossiers
-                if d["dossierId"] == "demo-dossier-001"
+                if d["dossierId"].startswith("demo-dossier-001")
             ]
 
         api.decide_batch = partial_decide
@@ -113,14 +113,33 @@ def main():
         ]
         print("PASS: partial model failure still returns 200 with safe fallback")
 
-        # The next evaluation reuses the cached decision and only asks the
-        # model about the dossier that fell back.
+        # A stable dossier must keep the same proposal across evaluations, so
+        # even its fallback is cached: the next evaluation makes no model call
+        # and returns byte-identical proposals.
+        first_proposals = response.json()["proposals"]
         calls.clear()
         request["evaluationId"] = "offline-evaluation-002"
         response = http.post("/a2a/", json=request)
         assert response.status_code == 200, response.text
-        assert calls[0] == ["demo-dossier-002"]
-        print("PASS: fallback decisions are not cached")
+        assert calls == []
+        assert response.json()["proposals"] == first_proposals
+        print("PASS: stable dossiers reuse the same proposal, fallback included")
+
+        # A fresh audit dossier's fallback is not cached (it never repeats,
+        # and a later identical one should get a real model decision).
+        calls.clear()
+        audit = two_dossier_request(public_key)
+        audit["evaluationId"] = "offline-evaluation-audit"
+        for d in audit["dossiers"]:
+            d["partition"] = "fresh_audit"
+            d["dossierId"] += "-audit"
+        audit["corpus"].update(stableCount=0, freshCount=2)
+        assert http.post("/a2a/", json=audit).status_code == 200
+        audit["evaluationId"] = "offline-evaluation-audit-2"
+        calls.clear()
+        assert http.post("/a2a/", json=audit).status_code == 200
+        assert calls and calls[0] == ["demo-dossier-002-audit"], calls
+        print("PASS: audit fallbacks are not cached")
 
         # 4. A total outage with nothing cached is still reported as 503.
         api.decide_batch = lambda dossiers, budget_seconds=None: []

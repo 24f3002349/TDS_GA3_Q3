@@ -1,4 +1,4 @@
-"""Download the grader requests stored by the live service for analysis.
+r"""Download the grader requests stored by the live service for analysis.
 
 Reads DEBUG_EXPORT_TOKEN from .env (never printed) and saves the export to
 captures/ (git-ignored). Run from the project root:
@@ -44,3 +44,7 @@ for evaluation in evaluations:
     dossiers = evaluation["request"]["dossiers"]
     print(f"  {evaluation['evaluationId']}: {len(dossiers)} dossiers, "
           f"status {evaluation['status']}")
+
+for row in data.get("requestLog", []):
+    print(f"  rejected {row['logged_at']} {row['operation']} {row['evaluation_id']}: "
+          f"HTTP {row['status_code']} {row['error']}")

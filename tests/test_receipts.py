@@ -72,12 +72,12 @@ assert not verify_receipt_signature(
 print("PASS: wrong public key rejected")
 
 good = signed_receipt["receiptSignature"]
-assert "+" in good or "/" in good  # true for almost every 64-byte signature
 urlsafe = good.replace("+", "-").replace("/", "_")
-assert not verify_receipt_signature(
-    evaluation_id, input_digest,
-    {**signed_receipt, "receiptSignature": urlsafe}, jwk,
-)
+if urlsafe != good:  # ~6% of signatures contain neither "+" nor "/"
+    assert not verify_receipt_signature(
+        evaluation_id, input_digest,
+        {**signed_receipt, "receiptSignature": urlsafe}, jwk,
+    )
 assert not verify_receipt_signature(
     evaluation_id, input_digest,
     {**signed_receipt, "receiptSignature": good.rstrip("=")}, jwk,

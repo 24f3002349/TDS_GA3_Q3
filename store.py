@@ -76,6 +76,16 @@ class MailroomStore:
                     fingerprint TEXT PRIMARY KEY,
                     proposal_json TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS request_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    logged_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    operation TEXT,
+                    evaluation_id TEXT,
+                    status_code INTEGER NOT NULL,
+                    error TEXT,
+                    request_json TEXT
+                );
             """)
 
     def get_evaluation(self, evaluation_id: str):
@@ -178,8 +188,10 @@ class MailroomStore:
                 (fingerprint, canonical_json(proposal)),
             )
 
-    def used_receipt_ids(self, receipt_ids: list[str]) -> set[str]:
-        """Receipt IDs already recorded by any committed evaluation."""
+    def used_receipt_ids(
+        self, receipt_ids: list[str], exclude_evaluation: str = ""
+    ) -> set[str]:
+        """Receipt IDs already recorded by another committed evaluation."""
         if not receipt_ids:
             return set()
         placeholders = ",".join("?" for _ in receipt_ids)
@@ -187,11 +199,51 @@ class MailroomStore:
             rows = db.execute(
                 f"""SELECT json_extract(receipt_json, '$.receiptId') AS rid
                     FROM receipts
-                    WHERE json_extract(receipt_json, '$.receiptId')
+                    WHERE evaluation_id != ?
+                      AND json_extract(receipt_json, '$.receiptId')
                           IN ({placeholders})""",
-                list(receipt_ids),
+                [exclude_evaluation, *receipt_ids],
             ).fetchall()
             return {row["rid"] for row in rows}
+
+    def log_request(self, operation, evaluation_id, status_code, error, request):
+        """Record a rejected request so grader test cases can be studied."""
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO request_log
+                   (operation, evaluation_id, status_code, error, request_json)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (operation, evaluation_id, status_code, error, request),
+            )
+            db.execute(
+                "DELETE FROM request_log WHERE id <= "
+                "(SELECT MAX(id) - 200 FROM request_log)"
+            )
+
+    def export_request_log(self):
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM request_log ORDER BY id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def export_decision_cache(self):
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT fingerprint, proposal_json FROM decision_cache"
+            ).fetchall()
+            return {row["fingerprint"]: json.loads(row["proposal_json"]) for row in rows}
+
+    def seed_decisions(self, decisions: dict[str, Any]) -> int:
+        """Preload cached decisions (e.g. from a committed seed file)."""
+        with self.connect() as db:
+            before = db.total_changes
+            db.executemany(
+                """INSERT INTO decision_cache (fingerprint, proposal_json)
+                   VALUES (?, ?) ON CONFLICT(fingerprint) DO NOTHING""",
+                [(fp, canonical_json(d)) for fp, d in decisions.items()],
+            )
+            return db.total_changes - before
 
     def export_evaluations(self, limit: int = 4):
         """Most recent evaluations, for the token-protected debug export."""

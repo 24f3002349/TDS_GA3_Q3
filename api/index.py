@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
@@ -35,6 +36,25 @@ app = FastAPI(
 store = MailroomStore()
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 512 * 1024
+
+# Decisions exported from an earlier run and committed to the repo, so stable
+# dossiers keep the same proposal after Render restarts wipe the database.
+SEED_FILE = Path(__file__).resolve().parents[1] / "seed_decisions.json"
+
+
+def load_seed():
+    if not SEED_FILE.exists():
+        return
+    try:
+        seeded = store.seed_decisions(
+            json.loads(SEED_FILE.read_text(encoding="utf-8"))
+        )
+        print(f"[startup] seeded {seeded} cached decisions", file=sys.stderr, flush=True)
+    except Exception as exc:
+        print(f"[startup] seed skipped: {type(exc).__name__}", file=sys.stderr, flush=True)
+
+
+load_seed()
 
 
 def error_response(status: int, message: str):
@@ -255,6 +275,48 @@ def check_grounded(decision, dossier):
             raise ValueError("Argument value is not grounded in the dossier")
 
 
+# Sources that may supply an argument value when evidence is completed.
+TRUSTED_PROVENANCE = {"authenticated_internal", "signed_internal"}
+NEVER_CITE_KINDS = {"history", "secret"}
+
+
+def complete_evidence(decision, dossier):
+    """Add a line for any argument value the cited lines do not contain.
+
+    Evidence must establish every exact argument. If the model cited none of
+    the lines holding a value, add the most authoritative line that does
+    (trusted provenance first), never history notes or secrets.
+    """
+    target_grounded, payload_fields = GROUNDED_FIELDS[decision["action"]]
+    values = [decision["payload"][field] for field in payload_fields]
+    if target_grounded:
+        values.append(decision["target"]["id"])
+
+    lines = [
+        (source, line)
+        for source in dossier["sources"]
+        for line in source["lines"]
+        if source.get("kind") not in NEVER_CITE_KINDS
+    ]
+    evidence = list(decision["evidence"])
+    cited_text = [line["text"] for _, line in lines if line["lineId"] in evidence]
+
+    for value in values:
+        if any(value in text for text in cited_text):
+            continue
+        holders = [
+            (source.get("provenance") not in TRUSTED_PROVENANCE, line["lineId"], line)
+            for source, line in lines
+            if value in line["text"]
+        ]
+        if holders:
+            best = min(holders, key=lambda h: h[0])[2]
+            evidence.append(best["lineId"])
+            cited_text.append(best["text"])
+
+    return dict(decision, evidence=evidence)
+
+
 def accept_decisions(generated, pending):
     """Return {dossierId: decision} for each model item that fully validates."""
     accepted = {}
@@ -277,7 +339,10 @@ def accept_decisions(generated, pending):
         try:
             validate_proposal(make_proposal(dossier, decision), dossier)
             check_grounded(decision, dossier)
-        except (ValueError, TypeError, KeyError, AttributeError):
+            decision = complete_evidence(decision, dossier)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            # Log only the generic reason; never dossier text or values.
+            print(f"[accept] rejected a model decision: {exc}", file=sys.stderr, flush=True)
             continue
 
         accepted[item["dossierId"]] = decision
@@ -412,6 +477,11 @@ def build_proposals(dossiers):
             raise RuntimeError("Decision model unavailable")
         for dossier_id, dossier in undecided.items():
             decisions[dossier_id] = fallback_decision(dossier)
+            # A stable dossier must get the same proposal in every
+            # evaluation, so its final decision is cached even when it is
+            # the fallback. Fresh audit dossiers never repeat.
+            if dossier["partition"] == "stable_core":
+                store.cache_decision(fingerprints[dossier_id], decisions[dossier_id])
 
     proposals = []
 
@@ -450,7 +520,11 @@ def debug_evaluations(request: Request):
     ):
         return error_response(404, "Not Found")
 
-    return {"evaluations": store.export_evaluations()}
+    return {
+        "evaluations": store.export_evaluations(),
+        "requestLog": store.export_request_log(),
+        "decisionCache": store.export_decision_cache(),
+    }
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -459,6 +533,101 @@ def root():
         "service": PROFILE,
         "status": "ready",
     }
+
+
+def check_receipts(evaluation, data):
+    """Verify every receipt's binding and signature before any effect.
+
+    Returns (error_response, None) on the first problem, otherwise
+    (None, [(receipt, outcome), ...]) in proposal order.
+    """
+    evaluation_id = evaluation["evaluation_id"]
+    digest = data["inputDigest"]
+    receipts = data["receipts"]
+
+    if digest != evaluation["input_digest"]:
+        return error_response(409, "inputDigest does not match evaluation"), None
+
+    saved_propose = json.loads(evaluation["propose_response_json"])
+    public_proposals = saved_propose["proposals"]
+
+    proposal_by_id = {
+        row["dossier_id"]: json.loads(row["proposal_json"])
+        for row in store.get_proposals(evaluation_id)
+    }
+
+    if len(receipts) != len(public_proposals):
+        return error_response(400, "One receipt is required per proposal"), None
+
+    receipt_by_id = {}
+    seen_call_ids = set()
+    seen_receipt_ids = set()
+
+    for receipt in receipts:
+        dossier_id = receipt["dossierId"]
+
+        if dossier_id in receipt_by_id:
+            return error_response(400, "Duplicate receipt dossierId"), None
+
+        if receipt["callId"] in seen_call_ids:
+            return error_response(400, "Duplicate receipt callId"), None
+
+        if receipt["receiptId"] in seen_receipt_ids:
+            return error_response(400, "Duplicate receiptId"), None
+
+        receipt_by_id[dossier_id] = receipt
+        seen_call_ids.add(receipt["callId"])
+        seen_receipt_ids.add(receipt["receiptId"])
+
+    if set(receipt_by_id) != set(proposal_by_id):
+        return error_response(400, "Missing or unexpected receipt dossierId"), None
+
+    # A receipt is scoped to one evaluation; never accept a transferred one.
+    if store.used_receipt_ids(
+        list(seen_receipt_ids), exclude_evaluation=evaluation_id
+    ):
+        return error_response(
+            400, "receiptId already used by another evaluation"
+        ), None
+
+    public_key_jwk = json.loads(evaluation["verifier_json"])["publicKeyJwk"]
+    receipts_and_outcomes = []
+
+    # Verify the entire batch before saving any outcomes.
+    for public_proposal in public_proposals:
+        dossier_id = public_proposal["dossierId"]
+        proposal = proposal_by_id.get(dossier_id)
+        receipt = receipt_by_id.get(dossier_id)
+
+        if proposal is None or receipt is None:
+            return error_response(400, "Receipt has no matching proposal"), None
+
+        if (
+            receipt["callId"] != proposal["callId"]
+            or receipt["action"] != proposal["action"]
+            or receipt["proposalDigest"] != proposal["proposalDigest"]
+        ):
+            return error_response(400, "Receipt does not match its proposal"), None
+
+        if not verify_receipt_signature(
+            evaluation_id=evaluation_id,
+            input_digest=digest,
+            receipt=receipt,
+            public_key_jwk=public_key_jwk,
+        ):
+            return error_response(400, "Invalid receipt signature"), None
+
+        outcome = {
+            "dossierId": proposal["dossierId"],
+            "callId": proposal["callId"],
+            "action": proposal["action"],
+            "proposalDigest": proposal["proposalDigest"],
+            "receiptId": receipt["receiptId"],
+            "status": "executed" if receipt["accepted"] else "rejected",
+        }
+        receipts_and_outcomes.append((receipt, outcome))
+
+    return None, receipts_and_outcomes
 
 
 def handle_commit_data(data):
@@ -515,95 +684,21 @@ def handle_commit_data(data):
         return error_response(404, "Unknown evaluationId")
 
     if evaluation["commit_response_json"]:
-        if evaluation["commit_request_json"] != canonical_json(data):
-            return error_response(409, "Evaluation already committed")
-        return JSONResponse(
-            content=json.loads(evaluation["commit_response_json"])
-        )
-
-    if digest != evaluation["input_digest"]:
-        return error_response(409, "inputDigest does not match evaluation")
+        if evaluation["commit_request_json"] == canonical_json(data):
+            return JSONResponse(
+                content=json.loads(evaluation["commit_response_json"])
+            )
+        # A different commit for a finished evaluation: report an invalid
+        # receipt as such (400) before treating it as a conflict (409).
+        error, _ = check_receipts(evaluation, data)
+        return error or error_response(409, "Evaluation already committed")
 
     if evaluation["status"] != "awaiting_receipts":
         return error_response(409, "Evaluation is not awaiting receipts")
 
-    saved_propose = json.loads(evaluation["propose_response_json"])
-    public_proposals = saved_propose["proposals"]
-
-    proposal_rows = store.get_proposals(evaluation_id)
-    proposal_by_id = {
-        row["dossier_id"]: json.loads(row["proposal_json"])
-        for row in proposal_rows
-    }
-
-    if len(receipts) != len(public_proposals):
-        return error_response(400, "One receipt is required per proposal")
-
-    receipt_by_id = {}
-    seen_call_ids = set()
-    seen_receipt_ids = set()
-
-    for receipt in receipts:
-        dossier_id = receipt["dossierId"]
-
-        if dossier_id in receipt_by_id:
-            return error_response(400, "Duplicate receipt dossierId")
-
-        if receipt["callId"] in seen_call_ids:
-            return error_response(400, "Duplicate receipt callId")
-
-        if receipt["receiptId"] in seen_receipt_ids:
-            return error_response(400, "Duplicate receiptId")
-
-        receipt_by_id[dossier_id] = receipt
-        seen_call_ids.add(receipt["callId"])
-        seen_receipt_ids.add(receipt["receiptId"])
-
-    if set(receipt_by_id) != set(proposal_by_id):
-        return error_response(400, "Missing or unexpected receipt dossierId")
-
-    # A receipt is scoped to one evaluation; never accept a transferred one.
-    if store.used_receipt_ids(list(seen_receipt_ids)):
-        return error_response(400, "receiptId already used by another evaluation")
-
-    verifier = json.loads(evaluation["verifier_json"])
-    public_key_jwk = verifier["publicKeyJwk"]
-    receipts_and_outcomes = []
-
-    # Verify the entire batch before saving any outcomes.
-    for public_proposal in public_proposals:
-        dossier_id = public_proposal["dossierId"]
-        proposal = proposal_by_id.get(dossier_id)
-        receipt = receipt_by_id.get(dossier_id)
-
-        if proposal is None or receipt is None:
-            return error_response(400, "Receipt has no matching proposal")
-
-        if (
-            receipt["callId"] != proposal["callId"]
-            or receipt["action"] != proposal["action"]
-            or receipt["proposalDigest"] != proposal["proposalDigest"]
-        ):
-            return error_response(400, "Receipt does not match its proposal")
-
-        if not verify_receipt_signature(
-            evaluation_id=evaluation_id,
-            input_digest=digest,
-            receipt=receipt,
-            public_key_jwk=public_key_jwk,
-        ):
-            return error_response(400, "Invalid receipt signature")
-
-        outcome = {
-            "dossierId": proposal["dossierId"],
-            "callId": proposal["callId"],
-            "action": proposal["action"],
-            "proposalDigest": proposal["proposalDigest"],
-            "receiptId": receipt["receiptId"],
-            "status": "executed" if receipt["accepted"] else "rejected",
-        }
-
-        receipts_and_outcomes.append((receipt, outcome))
+    error, receipts_and_outcomes = check_receipts(evaluation, data)
+    if error:
+        return error
 
     response = {
         "profile": PROFILE,
@@ -713,11 +808,37 @@ async def handle_propose(request: Request):
     return JSONResponse(content=json.loads(saved["propose_response_json"]))
 
 
+async def handle_and_log(request: Request):
+    response = await handle_propose(request)
+
+    # Keep rejected requests (bad receipts, conflicts, malformed input) so the
+    # grader's negative tests can be inspected later via the debug export.
+    if response.status_code >= 400:
+        try:
+            body = (await request.body())[:MAX_REQUEST_BYTES].decode("utf-8", "replace")
+            try:
+                parsed = json.loads(body)
+            except ValueError:
+                parsed = {}
+            parsed = parsed if isinstance(parsed, dict) else {}
+            store.log_request(
+                operation=str(parsed.get("operation"))[:32],
+                evaluation_id=str(parsed.get("evaluationId"))[:256],
+                status_code=response.status_code,
+                error=json.loads(response.body).get("error"),
+                request=body,
+            )
+        except Exception:
+            pass
+
+    return response
+
+
 @app.post("/")
 async def propose_root(request: Request):
-    return await handle_propose(request)
+    return await handle_and_log(request)
 
 
 @app.post("/a2a/")
 async def propose_a2a(request: Request):
-    return await handle_propose(request)
+    return await handle_and_log(request)

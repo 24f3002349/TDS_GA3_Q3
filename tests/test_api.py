@@ -211,6 +211,25 @@ def main():
         assert changed_replay.status_code == 409, changed_replay.text
         print("PASS: changed commit under the same evaluation ID rejected")
 
+        # An invalid receipt is reported as invalid (400) even after the
+        # evaluation is committed, not as a mere conflict (409).
+        late_invalid = make_commit(accepted=True)
+        sig = late_invalid["receipts"][0]["receiptSignature"]
+        late_invalid["receipts"][0]["receiptSignature"] = (
+            ("A" if sig[0] != "A" else "B") + sig[1:]
+        )
+        late = client.post("/a2a/", json=late_invalid)
+        assert late.status_code == 400, late.text
+        assert late.json()["error"] == "Invalid receipt signature"
+        print("PASS: invalid receipt after commit returns 400")
+
+        log = api.store.export_request_log()
+        assert any(
+            row["status_code"] == 400 and row["error"] == "Invalid receipt signature"
+            for row in log
+        )
+        print("PASS: rejected requests are logged for inspection")
+
         client.close()
 
     print("All offline API tests passed")

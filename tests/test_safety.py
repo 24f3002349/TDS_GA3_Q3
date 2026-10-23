@@ -28,7 +28,7 @@ DOSSIER = {
         {
             "sourceId": "mail-1",
             "kind": "email",
-            "provenance": "external",
+            "provenance": "external_unverified",
             "title": "Order question",
             "lines": [
                 {"lineId": "m1", "text": "From: pat@example.com"},
@@ -38,7 +38,7 @@ DOSSIER = {
         {
             "sourceId": "oms-1",
             "kind": "system_record",
-            "provenance": "internal",
+            "provenance": "authenticated_internal",
             "title": "Order record",
             "lines": [
                 {"lineId": "o1", "text": "ORD-77 status: in_transit"},
@@ -102,6 +102,15 @@ def main():
     bad["payload"] = dict(bad["payload"], status="delivered")
     assert not accepted(bad)
     print("PASS: invented status rejected")
+
+    # Evidence completion: a value the model did not cite gets its line,
+    # preferring the trusted record over the external email.
+    missing = draft(evidence=["m2"])
+    pending = {DOSSIER["dossierId"]: DOSSIER}
+    completed = api.accept_decisions([missing], pending)["safety-001"]["evidence"]
+    assert completed[0] == "m2"
+    assert set(completed) == {"m2", "o1", "o2"}, completed  # status via o1, recipient via o2
+    print("PASS: evidence completed with trusted lines for uncited values")
 
     # Outbound sends: every argument must be in a cited line.
     assert accepted(notice(["o1", "o2"]))
@@ -189,7 +198,7 @@ def main():
         print("PASS: debug export requires the configured token")
 
         # A receipt ID recorded by one evaluation cannot be reused by another.
-        api.store.used_receipt_ids = lambda ids: {"reused"}
+        api.store.used_receipt_ids = lambda ids, **kwargs: {"reused"}
         reuse = http.post("/a2a/", json={
             "profile": "ga5-mailroom-action-gate/v2",
             "operation": "commit",
