@@ -49,7 +49,7 @@ def decision(dossier_id):
         "dossierId": dossier_id,
         "action": "no_action",
         "target": None,
-        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": dossier_id},
+        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": "REF-1"},
         "evidence": ["line-1"],
     }
 

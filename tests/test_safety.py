@@ -103,6 +103,22 @@ def main():
     assert not accepted(bad)
     print("PASS: invented status rejected")
 
+    # A value found only in dossier metadata (the mailbox name) is not
+    # grounded: the owning team must come from a citable line.
+    confirm = {
+        "dossierId": "safety-001",
+        "action": "request_confirmation",
+        "target": {"kind": "approval_queue", "id": "orders"},
+        "payload": {
+            "claimedSender": "pat@example.com",
+            "questionCode": "VERIFY_REQUEST",
+            "referenceId": "ORD-77",
+        },
+        "evidence": ["m1", "m2"],
+    }
+    assert not accepted(confirm)
+    print("PASS: team taken from mailbox metadata rejected")
+
     # Evidence completion: a value the model did not cite gets its line,
     # preferring the trusted record over the external email.
     missing = draft(evidence=["m2"])
@@ -149,7 +165,7 @@ def main():
                     "target": None,
                     "payload": {
                         "reasonCode": "INFORMATIONAL",
-                        "referenceId": d["dossierId"],
+                        "referenceId": "REF-1",
                     },
                     "evidence": ["line-1"],
                 }

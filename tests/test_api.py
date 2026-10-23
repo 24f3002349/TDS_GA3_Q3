@@ -34,7 +34,7 @@ def make_request(public_key):
                 "lines": [
                     {
                         "lineId": "line-1",
-                        "text": "This is a synthetic informational message.",
+                        "text": "This is a synthetic informational message about REF-1.",
                     }
                 ],
             }
@@ -110,7 +110,7 @@ def main():
                     "target": None,
                     "payload": {
                         "reasonCode": "INFORMATIONAL",
-                        "referenceId": dossier["dossierId"],
+                        "referenceId": "REF-1",
                     },
                     "evidence": ["line-1"],
                 }
@@ -222,6 +222,12 @@ def main():
         assert late.status_code == 400, late.text
         assert late.json()["error"] == "Invalid receipt signature"
         print("PASS: invalid receipt after commit returns 400")
+
+        orphan = make_commit(accepted=True)
+        orphan["evaluationId"] = "orphan-evaluation"
+        orphan_response = client.post("/a2a/", json=orphan)
+        assert orphan_response.status_code == 409, orphan_response.text
+        print("PASS: commit for an unknown evaluation returns 409")
 
         log = api.store.export_request_log()
         assert any(

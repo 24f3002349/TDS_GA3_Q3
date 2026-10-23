@@ -268,7 +268,16 @@ def check_grounded(decision, dossier):
             if line["lineId"] in cited
         ]
     else:
-        texts = list(dossier_strings(dossier))
+        # Values must come from a line the decision could cite: not dossier
+        # metadata (such as the mailbox name) and not history notes or
+        # secrets. A quarantined artifact may also be named by its sourceId.
+        citable = [
+            source for source in dossier["sources"]
+            if source.get("kind") not in NEVER_CITE_KINDS
+        ]
+        texts = [line["text"] for source in citable for line in source["lines"]]
+        if action == "quarantine_item":
+            texts += [source.get("sourceId", "") for source in citable]
 
     for value in values:
         if not any(value in text for text in texts):
@@ -681,7 +690,9 @@ def handle_commit_data(data):
 
     evaluation = store.get_evaluation(evaluation_id)
     if evaluation is None:
-        return error_response(404, "Unknown evaluationId")
+        # Receipts for an evaluation we never proposed are rejected as a
+        # conflict with persisted state (409), alongside mismatched receipts.
+        return error_response(409, "Unknown evaluationId")
 
     if evaluation["commit_response_json"]:
         if evaluation["commit_request_json"] == canonical_json(data):
