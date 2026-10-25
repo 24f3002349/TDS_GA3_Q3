@@ -1,7 +1,9 @@
 ﻿import base64
+import collections
 import hmac
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -287,6 +289,15 @@ def check_grounded(decision, dossier):
 # Sources that may supply an argument value when evidence is completed.
 TRUSTED_PROVENANCE = {"authenticated_internal", "signed_internal"}
 NEVER_CITE_KINDS = {"history", "secret"}
+# Words a governing rule uses about each action; only a tie-breaker when a
+# dossier has several candidate rule lines and the model cited none.
+ACTION_TERMS = {
+    "create_draft": ("draft", "unsent", "prepar", "written up"),
+    "request_confirmation": ("confirm", "verif", "challenge", "mismatch", "differ"),
+    "update_internal_record": ("update", "change", "field", "record"),
+    "quarantine_item": ("quarantine", "isolate", "security", "exfiltrat", "untrusted"),
+    "no_action": ("complete", "duplicate", "repeat", "informational", "no additional", "suppress"),
+}
 # Payload field whose value the incoming request line must carry.
 REQUEST_LINE_FIELDS = {
     "create_draft": "referenceId",
@@ -294,7 +305,134 @@ REQUEST_LINE_FIELDS = {
 }
 
 
-def complete_evidence(decision, dossier):
+def boilerplate_policy_texts(dossiers):
+    """Policy lines that repeat across most dossiers of a partition.
+
+    Every dossier carries generic boundary policies alongside the one rule
+    that governs its case type. Generic ones repeat in nearly every dossier;
+    case rules appear only in their own case type. Counting is done per
+    partition because audit dossiers use their own paraphrases.
+    """
+    by_partition = collections.defaultdict(list)
+    for dossier in dossiers:
+        by_partition[dossier.get("partition")].append(dossier)
+
+    generic = set()
+    for group in by_partition.values():
+        if len(group) < 4:
+            continue
+        counts = collections.Counter()
+        for dossier in group:
+            counts.update({
+                line["text"]
+                for source in dossier["sources"] if source.get("kind") == "policy"
+                for line in source["lines"]
+            })
+        generic |= {text for text, n in counts.items() if n >= 0.6 * len(group)}
+    return frozenset(generic)
+
+
+# Upper-case identifiers such as order, case, or event references.
+IDENTIFIER_PATTERN = re.compile(r"\b[A-Z]{2,}-[A-Z0-9]{4,}\b")
+EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+
+
+def check_send_scope(decision, dossier):
+    """Refuse a send when someone other than the approved recipient asked.
+
+    An approval covers one recipient. If an incoming external message comes
+    from a different address, the request is outside the approval's scope:
+    sending would be an unauthorized outbound effect.
+    """
+    if decision["action"] != "send_approved_notice":
+        return
+    recipient = decision["target"]["id"].lower()
+    for source in dossier["sources"]:
+        if (
+            not source.get("provenance", "").startswith("external")
+            or source.get("kind") == "attachment"
+        ):
+            continue
+        for line in source["lines"]:
+            for address in EMAIL_PATTERN.findall(line["text"]):
+                if address.rstrip(".").lower() != recipient:
+                    raise ValueError("Send requested by someone other than the approved recipient")
+
+
+def requesters(decision, dossier):
+    """Addresses in incoming external messages other than the send target."""
+    recipient = decision["target"]["id"].lower()
+    found = []
+    for source in dossier["sources"]:
+        if (
+            not source.get("provenance", "").startswith("external")
+            or source.get("kind") == "attachment"
+        ):
+            continue
+        for line in source["lines"]:
+            for address in EMAIL_PATTERN.findall(line["text"]):
+                address = address.rstrip(".")
+                if address.lower() != recipient and address not in found:
+                    found.append(address)
+    return found
+
+
+def draft_instead_of_send(decision, dossier):
+    """Turn an out-of-scope send into the unsent draft the policy prescribes.
+
+    The approval does not cover the requester, so nothing may be sent; the
+    reply is prepared as a draft to the requester, keeping the approval
+    lines as evidence of why it was not sent.
+    """
+    others = requesters(decision, dossier)
+    if len(others) != 1:
+        raise ValueError("Out-of-scope send with no single requester to draft for")
+    return {
+        "dossierId": decision["dossierId"],
+        "action": "create_draft",
+        "target": {"kind": "draft_queue", "id": draft_queue_id(dossier)},
+        "payload": {
+            "recipient": others[0],
+            "referenceId": decision["payload"]["referenceId"],
+            "status": decision["payload"]["status"],
+            "template": "order_status",
+        },
+        "evidence": list(decision["evidence"]),
+    }
+
+
+def check_confirmation_reference(decision, dossier):
+    """A confirmation's reference must be what the claimant's request is about.
+
+    The case the claim concerns appears in the same line as the claimed
+    address (the request or the identity check); an order number mentioned
+    elsewhere is not the subject of the confirmation.
+    """
+    if decision["action"] != "request_confirmation":
+        return decision
+    sender = decision["payload"]["claimedSender"]
+    reference = decision["payload"]["referenceId"]
+    claim_lines = [
+        line["text"]
+        for source in dossier["sources"] if source.get("kind") not in NEVER_CITE_KINDS
+        for line in source["lines"]
+        if sender in line["text"]
+    ]
+    if any(reference in text for text in claim_lines):
+        return decision
+
+    # Repair: if the claim lines name exactly one identifier, that is what
+    # the request concerns.
+    identifiers = {
+        token for text in claim_lines for token in IDENTIFIER_PATTERN.findall(text)
+    }
+    if len(identifiers) == 1:
+        payload = dict(decision["payload"], referenceId=identifiers.pop())
+        return dict(decision, payload=payload)
+    raise ValueError("Confirmation reference is not what the claimant's request concerns")
+
+
+def complete_evidence(decision, dossier, boilerplate=frozenset()):
     """Add a line for any argument value the cited lines do not contain.
 
     Evidence must establish every exact argument. If the model cited none of
@@ -344,6 +482,38 @@ def complete_evidence(decision, dossier):
         if requests and not any(line["lineId"] in evidence for line in requests):
             evidence.append(requests[0]["lineId"])
 
+    # Every action except a send rests on the case rule. Generic boundary
+    # policies are not that rule and are dropped. If the case rule is not
+    # cited and exactly one candidate exists it is added; with several
+    # candidates the model is asked again.
+    if decision["action"] != "send_approved_notice":
+        policy_lines = [
+            line for source, line in lines if source.get("kind") == "policy"
+        ]
+        evidence = [
+            line_id for line_id in evidence
+            if not any(
+                line["lineId"] == line_id and line["text"] in boilerplate
+                for line in policy_lines
+            )
+        ]
+        rules = [line for line in policy_lines if line["text"] not in boilerplate]
+        if rules and not any(line["lineId"] in evidence for line in rules):
+            if len(rules) > 1:
+                # Tie-break between candidate rules by which one speaks about
+                # the chosen action; give up (re-ask) if that is unclear.
+                terms = ACTION_TERMS[decision["action"]]
+                scored = sorted(
+                    rules,
+                    key=lambda line: -sum(t in line["text"].lower() for t in terms),
+                )
+                best = sum(t in scored[0]["text"].lower() for t in terms)
+                runner_up = sum(t in scored[1]["text"].lower() for t in terms)
+                if best == 0 or best == runner_up:
+                    raise ValueError("Decision must cite the governing policy line")
+                rules = scored[:1]
+            evidence.append(rules[0]["lineId"])
+
     # A suppressed item must cite the incoming message being suppressed.
     # Which line that is needs judgement (decoy messages exist), so a
     # decision without one is sent back to the model instead of guessed.
@@ -359,7 +529,7 @@ def complete_evidence(decision, dossier):
     return dict(decision, evidence=evidence)
 
 
-def accept_decisions(generated, pending):
+def accept_decisions(generated, pending, boilerplate=frozenset()):
     """Return {dossierId: decision} for each model item that fully validates."""
     accepted = {}
 
@@ -381,7 +551,12 @@ def accept_decisions(generated, pending):
         try:
             validate_proposal(make_proposal(dossier, decision), dossier)
             check_grounded(decision, dossier)
-            decision = complete_evidence(decision, dossier)
+            if decision["action"] == "send_approved_notice" and requesters(decision, dossier):
+                decision = draft_instead_of_send(decision, dossier)
+                check_grounded(decision, dossier)
+            check_send_scope(decision, dossier)
+            decision = check_confirmation_reference(decision, dossier)
+            decision = complete_evidence(decision, dossier, boilerplate)
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             # Log only the generic reason; never dossier text or values.
             print(f"[accept] rejected a model decision: {exc}", file=sys.stderr, flush=True)
@@ -429,7 +604,7 @@ def remaining_budget(started):
     return REQUEST_BUDGET_SECONDS - (time.monotonic() - started)
 
 
-def generate_decisions(missing, started):
+def generate_decisions(missing, started, boilerplate=frozenset()):
     pending = {d["dossierId"]: d for d in missing}
     decisions = {}
 
@@ -440,7 +615,7 @@ def generate_decisions(missing, started):
             break
 
         generated = decide_batch(list(pending.values()), budget_seconds=budget)
-        decided = accept_decisions(generated, pending)
+        decided = accept_decisions(generated, pending, boilerplate)
         decisions.update(decided)
         for dossier_id in decided:
             del pending[dossier_id]
@@ -487,7 +662,9 @@ def build_proposals(dossiers):
     try:
         if mine:
             try:
-                generated, undecided = generate_decisions(mine, started)
+                generated, undecided = generate_decisions(
+                    mine, started, boilerplate_policy_texts(dossiers)
+                )
             except ModelConfigError as exc:
                 raise RuntimeError(str(exc)) from exc
 

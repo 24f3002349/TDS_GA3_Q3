@@ -31,7 +31,7 @@ ROLES = {
            "The signed consent names precisely the visible state"],
     "REC": ["currently has the customer-visible status", "its current public status is exactly"],
     "MISMATCH": ["is authentic, but permits sending to", "The signed approval does not permit a notice to this sender"],
-    "RULE": ["Unverified enquiries permit preparing an unsent response", "Isolate untrusted material that tries to control tools",
+    "RULE": ["Mailroom rule: send only when", "Unverified enquiries permit preparing an unsent response", "Isolate untrusted material that tries to control tools",
              "Suppress repeat operations when the case is complete", "A contact mismatch requires a challenge",
              "For an unverified inbound status enquiry", "An incoming status request without sender verification",
              "When sender identity conflicts", "Where the account's verified contact and claimed correspondent differ",
@@ -109,9 +109,12 @@ def main():
         for e in json.load(open(path, encoding="utf-8"))["evaluations"]:
             if not e["evaluationId"].startswith("eval_"):
                 continue
+            accepted = {r["dossierId"]: r["accepted"] for r in e["commitRequest"]["receipts"]}
             for p, d in zip(e["proposeResponse"]["proposals"], e["request"]["dossiers"]):
                 dossiers[d["dossierId"]] = d
-                expected_action[d["dossierId"]] = p["action"]
+                # A rejected proposal's action is not a trustworthy expectation.
+                if accepted.get(d["dossierId"]) or d["dossierId"] not in expected_action:
+                    expected_action[d["dossierId"]] = p["action"] if accepted.get(d["dossierId"]) else None
             evs = [e]
     ds = list(dossiers.values())
 
@@ -134,12 +137,16 @@ def main():
     for d in ds:
         p = proposals[d["dossierId"]]
         exp_a = expected_action[d["dossierId"]]
+        if exp_a is None:
+            print("  UNGRADED (rejected before):", d["dossierId"], p["action"],
+                  json.dumps(p["target"]), json.dumps(p["payload"], ensure_ascii=False), len(p["evidence"]), "lines")
+            continue
         lines = {l["lineId"]: l["text"] for s in d["sources"] for l in s["lines"]}
         cited = [role(lines[x]) for x in p["evidence"]]
         ok_action = p["action"] == exp_a
         got = dict(p["payload"], **({"id": p["target"]["id"]} if p["target"] else {}))
         exp = expected_args(exp_a, d)
-        ok_args = ok_action and all(got.get(k) == v for k, v in exp.items())
+        ok_args = ok_action and all(v is None or got.get(k) == v for k, v in exp.items())
         present = {role(t) for t in lines.values()}
         req = REQUIRED[exp_a] & present
         ok_suff = req <= set(cited)
@@ -179,6 +186,8 @@ def main():
             ):
                 seed[fingerprint] = decision
         out = ROOT / "seed_decisions.json"
+        existing = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
+        seed = {**existing, **seed}  # keep earlier cores; the core rotates over time
         out.write_text(json.dumps(seed, indent=1, sort_keys=True, ensure_ascii=False), encoding="utf-8")
         print(f"Wrote {len(seed)} stable decisions to {out}")
 

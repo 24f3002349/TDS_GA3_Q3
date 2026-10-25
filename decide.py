@@ -15,13 +15,19 @@ load_dotenv()
 
 
 def _model_list() -> list[str]:
-    """Primary model first, then fallbacks used when a model is overloaded."""
+    """Primary model first, then fallbacks used when a model is overloaded.
+
+    flash-lite leads: it answers a chunk in ~4s and, with the code-level
+    evidence checks, scored best on captured dossiers, while the larger
+    flash model often hits 503/504 under load. GEMINI_MODEL (if set) is the
+    first fallback; GEMINI_MODELS replaces the whole list.
+    """
     configured = os.getenv("GEMINI_MODELS", "")
     models = [m.strip() for m in configured.split(",") if m.strip()]
     if not models:
         models = [
-            os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
             "gemini-3.5-flash-lite",
+            os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
             "gemini-3-flash-preview",
             "gemini-3.1-flash-lite",
         ]
@@ -41,7 +47,8 @@ MAX_PARALLEL = int(os.getenv("DECISION_MAX_PARALLEL", "6"))
 BUDGET_SECONDS = float(os.getenv("DECISION_BUDGET_SECONDS", "30"))
 # "low" thinking roughly halves latency on the 3.x flash models.
 THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
-MAX_CALL_SECONDS = 25.0
+# Short enough that a stalled model still leaves time for a fallback.
+MAX_CALL_SECONDS = 15.0
 # Gemini rejects request deadlines shorter than 10 seconds with HTTP 400.
 MIN_CALL_SECONDS = 10.0
 
@@ -107,7 +114,11 @@ ACTIONS (pick the first that fits)
    and template approved_delivery_notice, its scope line names a status, and
    the authenticated order record shows that same status is current.
    If the approval names another recipient, another order, or a status that
-   is not the current one, do NOT send.
+   is not the current one, do NOT send. If an incoming message asks for the
+   notice and its sender address is not the approved recipient, the request
+   is outside the approval: do NOT send; create_draft to that requesting
+   sender instead (recipient = the requester's address), citing the rule,
+   the request line, the approval lines, and the order record.
 5. update_internal_record: a signed event authorizes a specific case to
    change delivery_window to an exact value.
 6. create_draft: an unverified customer asks for an order status update; a

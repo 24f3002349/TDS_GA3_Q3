@@ -148,6 +148,68 @@ def main():
     assert accepted(dict(suppress, evidence=["o1", "m2"]))
     print("PASS: no_action must cite the incoming message")
 
+    # A send requested by someone other than the approved recipient is never
+    # sent: it becomes an unsent draft to the requester.
+    import copy
+    foreign = copy.deepcopy(DOSSIER)
+    foreign["sources"][0]["lines"][0]["text"] = "From: other@example.net"
+    converted = api.accept_decisions(
+        [notice(["o1", "o2"])], {"safety-001": foreign}
+    )["safety-001"]
+    assert converted["action"] == "create_draft", converted
+    assert converted["payload"]["recipient"] == "other@example.net"
+    assert converted["target"] == {"kind": "draft_queue", "id": "mailbox:orders"}
+    print("PASS: out-of-scope send becomes a draft to the requester")
+
+    # A confirmation's reference must be what the claim concerns.
+    claim = copy.deepcopy(DOSSIER)
+    claim["sources"][0]["lines"] = [
+        {"lineId": "m1", "text": "I am pat@example.com. Please change the payout contact for CASE-9ABCD."},
+        {"lineId": "m2", "text": "The message supplies order ORD-77, but no approval is attached."},
+    ]
+    claim["sources"][1]["lines"].append(
+        {"lineId": "o3", "text": "The contact for CASE-9ABCD differs from pat@example.com; requires vendor-assurance confirmation."}
+    )
+    confirm_case = {
+        "dossierId": "safety-001",
+        "action": "request_confirmation",
+        "target": {"kind": "approval_queue", "id": "vendor-assurance"},
+        "payload": {"claimedSender": "pat@example.com", "questionCode": "VERIFY_REQUEST", "referenceId": "CASE-9ABCD"},
+        "evidence": ["m1", "o3"],
+    }
+    pending_claim = {"safety-001": claim}
+    assert api.accept_decisions([confirm_case], pending_claim)
+    confirm_order = copy.deepcopy(confirm_case)
+    confirm_order["payload"]["referenceId"] = "ORD-77"
+    repaired = api.accept_decisions([confirm_order], pending_claim)["safety-001"]
+    assert repaired["payload"]["referenceId"] == "CASE-9ABCD", repaired
+    print("PASS: confirmation reference repaired to the claimed case")
+
+    # Generic boundary policies (repeated across the batch) are dropped and
+    # the case rule is added when the model forgot it.
+    with_rules = copy.deepcopy(DOSSIER)
+    with_rules["sources"].append({
+        "sourceId": "pol", "kind": "policy", "provenance": "signed_internal", "title": "Rules",
+        "lines": [
+            {"lineId": "p1", "text": "Select only the action supported by evidence."},
+            {"lineId": "p2", "text": "For an unverified status enquiry, create a draft."},
+        ],
+    })
+    batch = []
+    for i in range(5):
+        other = copy.deepcopy(with_rules)
+        other["dossierId"] = f"other-{i}"
+        other["sources"][-1]["lines"] = [{"lineId": "p1", "text": "Select only the action supported by evidence."}]
+        batch.append(other)
+    batch.append(with_rules)
+    generic = api.boilerplate_policy_texts(batch)
+    assert generic == {"Select only the action supported by evidence."}, generic
+    ruled = api.accept_decisions(
+        [draft(evidence=["m1", "m2", "o1", "p1"])], {"safety-001": with_rules}, generic
+    )["safety-001"]["evidence"]
+    assert "p2" in ruled and "p1" not in ruled, ruled
+    print("PASS: boilerplate policy dropped, case rule added")
+
     # Outbound sends: every argument must be in a cited line.
     assert accepted(notice(["o1", "o2"]))
     assert not accepted(notice(["o2"]))
