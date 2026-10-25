@@ -89,7 +89,7 @@ def main():
         # 3. Model answers only one of two dossiers, even after the retry pass:
         #    propose still returns 200, the other gets the safe fallback,
         #    and only the real model decision is cached.
-        def partial_decide(dossiers, budget_seconds=None):
+        def partial_decide(dossiers, budget_seconds=None, **kwargs):
             calls.append([d["dossierId"] for d in dossiers])
             return [
                 decision(d["dossierId"])
@@ -142,7 +142,7 @@ def main():
         print("PASS: audit fallbacks are not cached")
 
         # 4. A total outage with nothing cached is still reported as 503.
-        api.decide_batch = lambda dossiers, budget_seconds=None: []
+        api.decide_batch = lambda dossiers, budget_seconds=None, **kwargs: []
         outage = make_request(public_key)
         outage["evaluationId"] = "offline-evaluation-003"
         outage["dossiers"][0]["dossierId"] = "demo-dossier-outage"
@@ -152,7 +152,7 @@ def main():
         print("PASS: total model outage returns 503 JSON")
 
         # 5. A missing API key is a clear configuration error.
-        def no_key(dossiers, budget_seconds=None):
+        def no_key(dossiers, budget_seconds=None, **kwargs):
             raise decide.ModelConfigError("GEMINI_API_KEY is missing from environment")
 
         api.decide_batch = no_key

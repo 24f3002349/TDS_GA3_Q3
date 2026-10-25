@@ -234,6 +234,18 @@ def main():
     assert result["payload"]["recipient"] == "pat@example.com"
     print("PASS: approval for an older status never produces a send")
 
+    # The draft carries the current status on record, not the approval's
+    # older one.
+    quoted = copy.deepcopy(old_status)
+    quoted["sources"][1]["lines"][0]["text"] = "Order ORD-77 currently has the status “in_transit”."
+    stale = notice(["o1", "o2"])
+    stale["payload"] = dict(stale["payload"], status="returned")
+    quoted["sources"][2]["lines"][1]["text"] = "The approval is valid for the status “returned” only."
+    result = accepted(dict(stale, evidence=["o1", "o2", "o4"]), quoted)
+    assert result["action"] == "create_draft", result
+    assert result["payload"]["status"] == "in_transit", result
+    print("PASS: draft uses the current status on record")
+
     # With nobody asking, an out-of-scope send cannot become a draft and is
     # rejected outright (the model is asked again, then the safe fallback).
     silent = copy.deepcopy(old_status)
@@ -276,7 +288,7 @@ def main():
         # Two concurrent evaluations with the same dossier: one model call.
         calls = []
 
-        def slow_decide(dossiers, budget_seconds=None):
+        def slow_decide(dossiers, budget_seconds=None, **kwargs):
             calls.append([d["dossierId"] for d in dossiers])
             time.sleep(0.5)
             return [

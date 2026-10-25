@@ -113,12 +113,15 @@ ACTIONS (pick the first that fits)
 4. send_approved_notice: a signed approval names this recipient, this order,
    and template approved_delivery_notice, its scope line names a status, and
    the authenticated order record shows that same status is current.
-   If the approval names another recipient, another order, or a status that
-   is not the current one, do NOT send. If an incoming message asks for the
-   notice and its sender address is not the approved recipient, the request
-   is outside the approval: do NOT send; create_draft to that requesting
-   sender instead (recipient = the requester's address), citing the rule,
-   the request line, the approval lines, and the order record.
+   Check three things against the approval: recipient, order, status.
+   * All three match (the status the approval names IS the current record
+     status, and anyone asking is the approved recipient): SEND. A request
+     from the approved recipient themselves is fine.
+   * The approval names a different recipient than the one asking, or a
+     status that is no longer current: do NOT send; create_draft to the
+     requesting sender (recipient = the requester's address) with the
+     CURRENT status from the order record, citing the rule, the request
+     line, the approval lines, and the order record.
 5. update_internal_record: a signed event authorizes a specific case to
    change delivery_window to an exact value.
 6. create_draft: an unverified customer asks for an order status update; a
@@ -303,6 +306,7 @@ def decide_chunk(
 def decide_batch(
     dossiers: list[dict[str, Any]],
     budget_seconds: float | None = None,
+    chunk_size: int | None = None,
 ) -> list[dict[str, Any]]:
     """Ask the model for proposals, in parallel chunks with model fallback.
 
@@ -315,10 +319,8 @@ def decide_batch(
 
     budget = BUDGET_SECONDS if budget_seconds is None else budget_seconds
     deadline = time.monotonic() + budget
-    chunks = [
-        dossiers[i:i + CHUNK_SIZE]
-        for i in range(0, len(dossiers), CHUNK_SIZE)
-    ]
+    size = chunk_size or CHUNK_SIZE
+    chunks = [dossiers[i:i + size] for i in range(0, len(dossiers), size)]
 
     client = make_client()
     try:

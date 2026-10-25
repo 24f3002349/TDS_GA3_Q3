@@ -198,6 +198,7 @@ DECISION_FIELDS = {"dossierId", "action", "target", "payload", "evidence"}
 # The grader allows 55 seconds per request; keep a margin for persistence.
 FIRST_PASS_SECONDS = 30
 RETRY_MIN_REMAINING_SECONDS = 12
+RETRY_ALONE_MAX = 6
 REQUEST_BUDGET_SECONDS = 43
 
 # Model-chosen argument values that must be copied from the dossier:
@@ -376,13 +377,32 @@ def send_in_scope(decision, dossier):
             for line in source["lines"]
         ]
 
-    approvals = lines_of("approval")
+    approvals = lines_of("approval", trusted_only=True)
     return (
         all(a.lower() == recipient.lower() for a in incoming_addresses(dossier))
         and any(recipient in text and reference in text for text in approvals)
         and any(status in text for text in approvals)
         and any(status in text for text in lines_of("record", trusted_only=True))
     )
+
+
+def in_scope_send_for_draft(decision, dossier):
+    """True when a draft could have been a fully approved send.
+
+    The model sometimes drafts a case whose approval covers exactly this
+    recipient, order, and current status; such a dossier is asked again on
+    its own. The model decides; code never turns a draft into a send.
+    """
+    if decision["action"] != "create_draft":
+        return False
+    candidate = {
+        "target": {"kind": "email", "id": decision["payload"]["recipient"]},
+        "payload": {
+            "referenceId": decision["payload"]["referenceId"],
+            "status": decision["payload"]["status"],
+        },
+    }
+    return send_in_scope(candidate, dossier)
 
 
 def check_send_scope(decision, dossier):
@@ -413,6 +433,36 @@ def draft_instead_of_send(decision, dossier):
         },
         "evidence": list(decision["evidence"]),
     }
+
+
+QUOTED_PATTERN = re.compile(r"[“\"]([^”\"]+)[”\"]")
+
+
+def check_draft_status(decision, dossier):
+    """A status draft must carry the order's current status on record.
+
+    The trusted record line for the referenced order states the current
+    status (an approval may name an older one). If the draft's status is
+    not in that line and the line quotes exactly one status, use it.
+    """
+    if decision["action"] != "create_draft":
+        return decision
+    reference = decision["payload"]["referenceId"]
+    status = decision["payload"]["status"]
+    records = [
+        line["text"]
+        for source in dossier["sources"]
+        if source.get("kind") == "record" and source.get("provenance") in TRUSTED_PROVENANCE
+        for line in source["lines"]
+        if reference in line["text"]
+    ]
+    if not records or any(status in text for text in records):
+        return decision
+    quoted = {q for text in records for q in QUOTED_PATTERN.findall(text)}
+    if len(quoted) == 1:
+        payload = dict(decision["payload"], status=quoted.pop())
+        return dict(decision, payload=payload)
+    raise ValueError("Draft status is not the current status on record")
 
 
 NO_ACTION_STATES = {
@@ -580,7 +630,7 @@ def complete_evidence(decision, dossier, boilerplate=frozenset()):
     return dict(decision, evidence=evidence)
 
 
-def accept_decisions(generated, pending, boilerplate=frozenset()):
+def accept_decisions(generated, pending, boilerplate=frozenset(), first_pass=False):
     """Return {dossierId: decision} for each model item that fully validates."""
     accepted = {}
 
@@ -599,6 +649,15 @@ def accept_decisions(generated, pending, boilerplate=frozenset()):
             continue
 
         decision = {field: item[field] for field in DECISION_FIELDS}
+        # Drop invented or repeated line IDs instead of discarding the whole
+        # decision; the checks below re-add any line that is actually needed.
+        if isinstance(decision["evidence"], list):
+            known = {
+                line["lineId"] for source in dossier["sources"] for line in source["lines"]
+            }
+            decision["evidence"] = list(dict.fromkeys(
+                x for x in decision["evidence"] if isinstance(x, str) and x in known
+            ))
         try:
             validate_proposal(make_proposal(dossier, decision), dossier)
             check_grounded(decision, dossier)
@@ -608,6 +667,9 @@ def accept_decisions(generated, pending, boilerplate=frozenset()):
             check_send_scope(decision, dossier)
             decision = check_confirmation_reference(decision, dossier)
             decision = check_no_action_reason(decision, dossier)
+            decision = check_draft_status(decision, dossier)
+            if first_pass and in_scope_send_for_draft(decision, dossier):
+                raise ValueError("Drafted a case with an in-scope approval; asking again alone")
             decision = complete_evidence(decision, dossier, boilerplate)
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             # Log only the generic reason; never dossier text or values.
@@ -662,12 +724,19 @@ def generate_decisions(missing, started, boilerplate=frozenset()):
 
     budget = min(FIRST_PASS_SECONDS, remaining_budget(started))
 
-    for _ in range(2):
+    for attempt in range(2):
         if not pending:
             break
 
-        generated = decide_batch(list(pending.values()), budget_seconds=budget)
-        decided = accept_decisions(generated, pending, boilerplate)
+        # The retry asks each remaining dossier on its own (in parallel) when
+        # there are only a few: the model is most reliable without neighbours.
+        retry_alone = attempt == 1 and len(pending) <= RETRY_ALONE_MAX
+        generated = decide_batch(
+            list(pending.values()),
+            budget_seconds=budget,
+            **({"chunk_size": 1} if retry_alone else {}),
+        )
+        decided = accept_decisions(generated, pending, boilerplate, first_pass=attempt == 0)
         decisions.update(decided)
         for dossier_id in decided:
             del pending[dossier_id]
