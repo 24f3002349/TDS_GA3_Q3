@@ -135,7 +135,7 @@ def main():
     pending = {DOSSIER["dossierId"]: DOSSIER}
     completed = api.accept_decisions([missing], pending)["safety-001"]["evidence"]
     assert completed[0] == "m2"
-    assert set(completed) == {"m2", "o1", "o2"}, completed  # status via o1, recipient via o2
+    assert set(completed) == {"m2", "o1", "o2", "o4"}, completed  # status via o1, recipient via o2, whole approval
     print("PASS: evidence completed with trusted lines for uncited values")
 
     # A draft answers a request: the customer's request line (the external
@@ -245,6 +245,24 @@ def main():
     assert result["action"] == "create_draft", result
     assert result["payload"]["status"] == "in_transit", result
     print("PASS: draft uses the current status on record")
+
+    # A draft written while an approval exists for another recipient cites
+    # that approval (why it is drafted, not sent); unrelated approvals are
+    # not cited.
+    other_recipient = copy.deepcopy(DOSSIER)
+    other_recipient["sources"][0]["lines"][0]["text"] = "From: asker@example.net"
+    other_recipient["sources"][2]["lines"].append(
+        {"lineId": "o6", "text": "The approval register contains a closed notice for unrelated ORD-99; it is not scoped to ORD-77."}
+    )
+    drafted = accepted({
+        "dossierId": "safety-001", "action": "create_draft",
+        "target": {"kind": "draft_queue", "id": "mailbox:orders"},
+        "payload": {"recipient": "asker@example.net", "referenceId": "ORD-77",
+                    "status": "in_transit", "template": "order_status"},
+        "evidence": ["m1", "m2", "o1"],
+    }, other_recipient)
+    assert {"o2", "o4"} <= set(drafted["evidence"]), drafted
+    print("PASS: draft cites the approval that does not cover it")
 
     # With nobody asking, an out-of-scope send cannot become a draft and is
     # rejected outright (the model is asked again, then the safe fallback).

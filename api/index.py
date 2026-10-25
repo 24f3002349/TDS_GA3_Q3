@@ -536,6 +536,23 @@ def check_confirmation_reference(decision, dossier):
     raise ValueError("Confirmation reference is not what the claimant's request concerns")
 
 
+def related_approval_lines(decision, dossier):
+    """Line IDs of trusted approvals that concern this draft's request."""
+    reference = decision["payload"]["referenceId"]
+    recipient = decision["payload"]["recipient"]
+    found = []
+    for source in dossier["sources"]:
+        if source.get("kind") != "approval" or source.get("provenance") not in TRUSTED_PROVENANCE:
+            continue
+        if any(
+            (reference in line["text"] and EMAIL_PATTERN.search(line["text"]))
+            or recipient in line["text"]
+            for line in source["lines"]
+        ):
+            found.extend(line["lineId"] for line in source["lines"])
+    return found
+
+
 def complete_evidence(decision, dossier, boilerplate=frozenset()):
     """Add a line for any argument value the cited lines do not contain.
 
@@ -617,6 +634,17 @@ def complete_evidence(decision, dossier, boilerplate=frozenset()):
                     raise ValueError("Decision must cite the governing policy line")
                 rules = scored[:1]
             evidence.append(rules[0]["lineId"])
+
+    # A draft written although an approval exists must cite that approval:
+    # it shows why the reply is drafted rather than sent (another recipient
+    # or an older status). An approval counts when one of its lines names
+    # this order together with a recipient address, or names the draft's
+    # recipient; decoy approvals about other orders carry no such address.
+    if decision["action"] == "create_draft":
+        evidence.extend(
+            line_id for line_id in related_approval_lines(decision, dossier)
+            if line_id not in evidence
+        )
 
     # A suppressed item must cite the incoming message being suppressed.
     # Which line that is needs judgement (decoy messages exist), so a
