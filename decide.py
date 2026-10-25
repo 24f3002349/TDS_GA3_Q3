@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -19,17 +20,17 @@ def _model_list() -> list[str]:
 
     flash-lite leads: it answers a chunk in ~4s and, with the code-level
     evidence checks, scored best on captured dossiers, while the larger
-    flash model often hits 503/504 under load. GEMINI_MODEL (if set) is the
-    first fallback; GEMINI_MODELS replaces the whole list.
+    flash model often hits 503/504 or stalls under load, so it (GEMINI_MODEL)
+    comes last, after the fast models. GEMINI_MODELS replaces the list.
     """
     configured = os.getenv("GEMINI_MODELS", "")
     models = [m.strip() for m in configured.split(",") if m.strip()]
     if not models:
         models = [
             "gemini-3.5-flash-lite",
-            os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
-            "gemini-3-flash-preview",
             "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+            os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
         ]
     return list(dict.fromkeys(models))
 
@@ -55,6 +56,11 @@ MIN_CALL_SECONDS = 10.0
 
 class ModelConfigError(RuntimeError):
     """A permanent configuration problem, such as a missing API key."""
+
+
+# Recent model failures (metadata only), exposed by the debug export so a
+# fallback in a graded run can be traced to its cause.
+RECENT_ERRORS: deque = deque(maxlen=100)
 
 
 def log(message: str) -> None:
@@ -295,6 +301,14 @@ def decide_chunk(
                 f"model={model} chunk={len(chunk)} failed: "
                 f"{type(exc).__name__} {getattr(exc, 'code', '')}"
             )
+            RECENT_ERRORS.append({
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "model": model,
+                "chunk": len(chunk),
+                "error": type(exc).__name__,
+                "code": getattr(exc, "code", None),
+                "seconds": round(time.monotonic() - started, 1),
+            })
             if is_auth_error(exc):
                 raise ModelConfigError("GEMINI_API_KEY was rejected") from exc
 

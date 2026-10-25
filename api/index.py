@@ -26,6 +26,7 @@ from core import (
     validate_dossiers,
     validate_proposal,
 )
+import decide
 from decide import ModelConfigError, decide_batch
 from store import MailroomStore
 
@@ -193,11 +194,13 @@ def public_proposal(proposal):
 
 
 DECISION_FIELDS = {"dossierId", "action", "target", "payload", "evidence"}
-# One extra model pass for dossiers whose first decision was missing or
-# invalid, but only while enough of the request's time budget remains.
-# The grader allows 55 seconds per request; keep a margin for persistence.
-FIRST_PASS_SECONDS = 30
-RETRY_MIN_REMAINING_SECONDS = 12
+# Extra model passes for dossiers whose decision was missing or invalid,
+# while enough of the request's time budget remains. The grader allows 55
+# seconds per request; keep a margin for persistence.
+FIRST_PASS_SECONDS = 20
+RETRY_PASS_SECONDS = 15
+MAX_PASSES = 4
+RETRY_MIN_REMAINING_SECONDS = 11
 RETRY_ALONE_MAX = 6
 REQUEST_BUDGET_SECONDS = 43
 
@@ -724,13 +727,13 @@ def generate_decisions(missing, started, boilerplate=frozenset()):
 
     budget = min(FIRST_PASS_SECONDS, remaining_budget(started))
 
-    for attempt in range(2):
+    for attempt in range(MAX_PASSES):
         if not pending:
             break
 
-        # The retry asks each remaining dossier on its own (in parallel) when
+        # Retries ask each remaining dossier on its own (in parallel) when
         # there are only a few: the model is most reliable without neighbours.
-        retry_alone = attempt == 1 and len(pending) <= RETRY_ALONE_MAX
+        retry_alone = attempt >= 1 and len(pending) <= RETRY_ALONE_MAX
         generated = decide_batch(
             list(pending.values()),
             budget_seconds=budget,
@@ -741,7 +744,7 @@ def generate_decisions(missing, started, boilerplate=frozenset()):
         for dossier_id in decided:
             del pending[dossier_id]
 
-        budget = remaining_budget(started)
+        budget = min(RETRY_PASS_SECONDS, remaining_budget(started))
         if budget < RETRY_MIN_REMAINING_SECONDS:
             break
 
@@ -865,6 +868,7 @@ def debug_evaluations(request: Request):
         "evaluations": store.export_evaluations(),
         "requestLog": store.export_request_log(),
         "decisionCache": store.export_decision_cache(),
+        "modelErrors": list(decide.RECENT_ERRORS),
     }
 
 

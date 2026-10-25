@@ -107,10 +107,10 @@ def main():
             "demo-dossier-001": "no_action",
             "demo-dossier-002": "request_confirmation",
         }
-        assert calls == [
-            ["demo-dossier-001", "demo-dossier-002"],
-            ["demo-dossier-002"],
-        ]
+        # First pass asks both; every retry pass asks only the missing one.
+        assert calls[0] == ["demo-dossier-001", "demo-dossier-002"]
+        assert 2 <= len(calls) <= api.MAX_PASSES
+        assert all(c == ["demo-dossier-002"] for c in calls[1:]), calls
         print("PASS: partial model failure still returns 200 with safe fallback")
 
         # A stable dossier must keep the same proposal across evaluations, so
@@ -140,6 +140,26 @@ def main():
         assert http.post("/a2a/", json=audit).status_code == 200
         assert calls and calls[0] == ["demo-dossier-002-audit"], calls
         print("PASS: audit fallbacks are not cached")
+
+        # 3b. Model calls that fail twice (rate limits, timeouts) and then
+        #     succeed still yield the real decision, not the fallback.
+        flaky_calls = []
+
+        def flaky_decide(dossiers, budget_seconds=None, **kwargs):
+            flaky_calls.append(len(dossiers))
+            if len(flaky_calls) <= 2:
+                return []
+            return [decision(d["dossierId"]) for d in dossiers]
+
+        api.decide_batch = flaky_decide
+        flaky = make_request(public_key)
+        flaky["evaluationId"] = "offline-evaluation-flaky"
+        flaky["dossiers"][0]["dossierId"] = "demo-dossier-flaky"
+        response = http.post("/a2a/", json=flaky)
+        assert response.status_code == 200, response.text
+        assert response.json()["proposals"][0]["action"] == "no_action", response.text
+        assert len(flaky_calls) == 3, flaky_calls
+        print("PASS: two failed model passes still end in a real decision")
 
         # 4. A total outage with nothing cached is still reported as 503.
         api.decide_batch = lambda dossiers, budget_seconds=None, **kwargs: []
