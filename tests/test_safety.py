@@ -27,7 +27,7 @@ DOSSIER = {
     "sources": [
         {
             "sourceId": "mail-1",
-            "kind": "email",
+            "kind": "message",
             "provenance": "external_unverified",
             "title": "Order question",
             "lines": [
@@ -37,12 +37,21 @@ DOSSIER = {
         },
         {
             "sourceId": "oms-1",
-            "kind": "system_record",
+            "kind": "record",
             "provenance": "authenticated_internal",
             "title": "Order record",
             "lines": [
                 {"lineId": "o1", "text": "ORD-77 status: in_transit"},
-                {"lineId": "o2", "text": "Approved: send approved_delivery_notice to pat@example.com"},
+            ],
+        },
+        {
+            "sourceId": "appr-1",
+            "kind": "approval",
+            "provenance": "signed_internal",
+            "title": "Outbound approval",
+            "lines": [
+                {"lineId": "o2", "text": "Approval EVT-1 permits one notice for ORD-77 to pat@example.com using template approved_delivery_notice."},
+                {"lineId": "o4", "text": "The approval is valid for the status in_transit only."},
             ],
         },
     ],
@@ -80,9 +89,10 @@ def notice(evidence):
     }
 
 
-def accepted(decision):
-    pending = {DOSSIER["dossierId"]: DOSSIER}
-    return bool(api.accept_decisions([decision], pending))
+def accepted(decision, dossier=None):
+    """The accepted decision (possibly repaired), or None if rejected."""
+    dossier = dossier or DOSSIER
+    return api.accept_decisions([decision], {dossier["dossierId"]: dossier}).get(dossier["dossierId"])
 
 
 def main():
@@ -211,9 +221,38 @@ def main():
     print("PASS: boilerplate policy dropped, case rule added")
 
     # Outbound sends: every argument must be in a cited line.
-    assert accepted(notice(["o1", "o2"]))
+    assert accepted(notice(["o1", "o2"]))["action"] == "send_approved_notice"
     assert not accepted(notice(["o2"]))
     print("PASS: send requires recipient, reference, and status in cited lines")
+
+    # An approval for an older status does not cover the current one: the
+    # send becomes an unsent draft to the requester.
+    old_status = copy.deepcopy(DOSSIER)
+    old_status["sources"][2]["lines"][1]["text"] = "The approval is valid for the status returned only."
+    result = accepted(notice(["o1", "o2"]), old_status)
+    assert result["action"] == "create_draft", result
+    assert result["payload"]["recipient"] == "pat@example.com"
+    print("PASS: approval for an older status never produces a send")
+
+    # With nobody asking, an out-of-scope send cannot become a draft and is
+    # rejected outright (the model is asked again, then the safe fallback).
+    silent = copy.deepcopy(old_status)
+    silent["sources"][0]["lines"][0]["text"] = "Sent by the gateway."
+    assert not accepted(notice(["o1", "o2"]), silent)
+    print("PASS: out-of-scope send with no requester is rejected")
+
+    # no_action reasonCode follows the case state on record.
+    state = copy.deepcopy(DOSSIER)
+    state["sources"][1]["lines"].append(
+        {"lineId": "o5", "text": "CASE-77AB records this item as already completed."}
+    )
+    fixed = accepted({
+        "dossierId": "safety-001", "action": "no_action", "target": None,
+        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": "CASE-77AB"},
+        "evidence": ["o5", "m2"],
+    }, state)
+    assert fixed["payload"]["reasonCode"] == "ALREADY_COMPLETED", fixed
+    print("PASS: no_action reasonCode corrected to the recorded state")
 
     public_key = b"\x01" * 32
 

@@ -337,31 +337,8 @@ IDENTIFIER_PATTERN = re.compile(r"\b[A-Z]{2,}-[A-Z0-9]{4,}\b")
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 
 
-def check_send_scope(decision, dossier):
-    """Refuse a send when someone other than the approved recipient asked.
-
-    An approval covers one recipient. If an incoming external message comes
-    from a different address, the request is outside the approval's scope:
-    sending would be an unauthorized outbound effect.
-    """
-    if decision["action"] != "send_approved_notice":
-        return
-    recipient = decision["target"]["id"].lower()
-    for source in dossier["sources"]:
-        if (
-            not source.get("provenance", "").startswith("external")
-            or source.get("kind") == "attachment"
-        ):
-            continue
-        for line in source["lines"]:
-            for address in EMAIL_PATTERN.findall(line["text"]):
-                if address.rstrip(".").lower() != recipient:
-                    raise ValueError("Send requested by someone other than the approved recipient")
-
-
-def requesters(decision, dossier):
-    """Addresses in incoming external messages other than the send target."""
-    recipient = decision["target"]["id"].lower()
+def incoming_addresses(dossier):
+    """Addresses in incoming external messages (not attachments)."""
     found = []
     for source in dossier["sources"]:
         if (
@@ -372,33 +349,104 @@ def requesters(decision, dossier):
         for line in source["lines"]:
             for address in EMAIL_PATTERN.findall(line["text"]):
                 address = address.rstrip(".")
-                if address.lower() != recipient and address not in found:
+                if address not in found:
                     found.append(address)
     return found
+
+
+def send_in_scope(decision, dossier):
+    """True only when a signed approval covers this exact send.
+
+    The approval itself must name the recipient and the order, an approval
+    line must name the exact status, a trusted record must show that status
+    is current, and nobody other than the approved recipient may be the one
+    asking. Anything else (another recipient, an older status, a different
+    requester) is outside the approval and must not be sent.
+    """
+    recipient = decision["target"]["id"]
+    reference = decision["payload"]["referenceId"]
+    status = decision["payload"]["status"]
+
+    def lines_of(kind, trusted_only=False):
+        return [
+            line["text"]
+            for source in dossier["sources"]
+            if source.get("kind") == kind
+            and (not trusted_only or source.get("provenance") in TRUSTED_PROVENANCE)
+            for line in source["lines"]
+        ]
+
+    approvals = lines_of("approval")
+    return (
+        all(a.lower() == recipient.lower() for a in incoming_addresses(dossier))
+        and any(recipient in text and reference in text for text in approvals)
+        and any(status in text for text in approvals)
+        and any(status in text for text in lines_of("record", trusted_only=True))
+    )
+
+
+def check_send_scope(decision, dossier):
+    """Last line of defence: never let an out-of-scope send through."""
+    if decision["action"] == "send_approved_notice" and not send_in_scope(decision, dossier):
+        raise ValueError("Send is not covered by a matching signed approval")
 
 
 def draft_instead_of_send(decision, dossier):
     """Turn an out-of-scope send into the unsent draft the policy prescribes.
 
-    The approval does not cover the requester, so nothing may be sent; the
-    reply is prepared as a draft to the requester, keeping the approval
-    lines as evidence of why it was not sent.
+    The approval does not cover this send, so nothing may be sent; the reply
+    is prepared as a draft to whoever asked, keeping the approval lines as
+    evidence of why it was not sent.
     """
-    others = requesters(decision, dossier)
-    if len(others) != 1:
+    asking = incoming_addresses(dossier)
+    if len(asking) != 1:
         raise ValueError("Out-of-scope send with no single requester to draft for")
     return {
         "dossierId": decision["dossierId"],
         "action": "create_draft",
         "target": {"kind": "draft_queue", "id": draft_queue_id(dossier)},
         "payload": {
-            "recipient": others[0],
+            "recipient": asking[0],
             "referenceId": decision["payload"]["referenceId"],
             "status": decision["payload"]["status"],
             "template": "order_status",
         },
         "evidence": list(decision["evidence"]),
     }
+
+
+NO_ACTION_STATES = {
+    "ALREADY_COMPLETED": ("completed",),
+    "DUPLICATE": ("duplicate",),
+    "INFORMATIONAL": ("informational",),
+}
+
+
+def check_no_action_reason(decision, dossier):
+    """Align a no_action reasonCode with the case state on record.
+
+    The trusted record line about the referenced case states whether the
+    item is completed, a duplicate, or informational; if it names exactly
+    one of these, the reasonCode must be that one.
+    """
+    if decision["action"] != "no_action":
+        return decision
+    reference = decision["payload"]["referenceId"]
+    records = [
+        line["text"].lower()
+        for source in dossier["sources"]
+        if source.get("kind") == "record" and source.get("provenance") in TRUSTED_PROVENANCE
+        for line in source["lines"]
+        if reference in line["text"]
+    ]
+    states = {
+        code for code, words in NO_ACTION_STATES.items()
+        if any(word in text for text in records for word in words)
+    }
+    if len(states) == 1 and decision["payload"]["reasonCode"] not in states:
+        payload = dict(decision["payload"], reasonCode=states.pop())
+        return dict(decision, payload=payload)
+    return decision
 
 
 def check_confirmation_reference(decision, dossier):
@@ -412,9 +460,12 @@ def check_confirmation_reference(decision, dossier):
         return decision
     sender = decision["payload"]["claimedSender"]
     reference = decision["payload"]["referenceId"]
+    # The claim (the requester's message) and the identity check (a record)
+    # are what a confirmation concerns; approvals or policies that happen to
+    # mention the address are not.
     claim_lines = [
         line["text"]
-        for source in dossier["sources"] if source.get("kind") not in NEVER_CITE_KINDS
+        for source in dossier["sources"] if source.get("kind") in ("message", "record")
         for line in source["lines"]
         if sender in line["text"]
     ]
@@ -551,11 +602,12 @@ def accept_decisions(generated, pending, boilerplate=frozenset()):
         try:
             validate_proposal(make_proposal(dossier, decision), dossier)
             check_grounded(decision, dossier)
-            if decision["action"] == "send_approved_notice" and requesters(decision, dossier):
+            if decision["action"] == "send_approved_notice" and not send_in_scope(decision, dossier):
                 decision = draft_instead_of_send(decision, dossier)
                 check_grounded(decision, dossier)
             check_send_scope(decision, dossier)
             decision = check_confirmation_reference(decision, dossier)
+            decision = check_no_action_reason(decision, dossier)
             decision = complete_evidence(decision, dossier, boilerplate)
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             # Log only the generic reason; never dossier text or values.
