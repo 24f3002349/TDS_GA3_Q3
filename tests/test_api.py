@@ -37,7 +37,19 @@ def make_request(public_key):
                         "text": "This is a synthetic informational message about REF-1.",
                     }
                 ],
-            }
+            },
+            {
+                "sourceId": "source-2",
+                "kind": "record",
+                "provenance": "authenticated_internal",
+                "title": "Case record",
+                "lines": [
+                    {
+                        "lineId": "line-2",
+                        "text": "REF-1 records this item as informational.",
+                    }
+                ],
+            },
         ],
     }
 

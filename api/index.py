@@ -496,6 +496,12 @@ def check_no_action_reason(decision, dossier):
         code for code, words in NO_ACTION_STATES.items()
         if any(word in text for text in records for word in words)
     }
+    if not states:
+        # Suppressing needs a trusted record saying the referenced item is
+        # completed, a duplicate, or informational. Without one, no_action
+        # would silently drop live content (e.g. an injection attempt), so
+        # the model is asked again.
+        raise ValueError("no_action without a recorded completed/duplicate/informational state")
     if len(states) == 1 and decision["payload"]["reasonCode"] not in states:
         payload = dict(decision["payload"], reasonCode=states.pop())
         return dict(decision, payload=payload)

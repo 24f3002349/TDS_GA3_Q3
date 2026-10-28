@@ -147,15 +147,20 @@ def main():
     print("PASS: draft evidence always includes the customer's request line")
 
     # no_action without the incoming message is sent back to the model.
+    import copy
+    duplicate = copy.deepcopy(DOSSIER)
+    duplicate["sources"][1]["lines"].append(
+        {"lineId": "o7", "text": "ORD-77 records this item as a duplicate."}
+    )
     suppress = {
         "dossierId": "safety-001",
         "action": "no_action",
         "target": None,
         "payload": {"reasonCode": "DUPLICATE", "referenceId": "ORD-77"},
-        "evidence": ["o1"],
+        "evidence": ["o7"],
     }
-    assert not accepted(suppress)
-    assert accepted(dict(suppress, evidence=["o1", "m2"]))
+    assert not accepted(suppress, duplicate)
+    assert accepted(dict(suppress, evidence=["o7", "m2"]), duplicate)
     print("PASS: no_action must cite the incoming message")
 
     # A send requested by someone other than the approved recipient is never
@@ -283,6 +288,15 @@ def main():
     }, state)
     assert fixed["payload"]["reasonCode"] == "ALREADY_COMPLETED", fixed
     print("PASS: no_action reasonCode corrected to the recorded state")
+
+    # no_action without any recorded state for the case is not accepted
+    # (it would silently drop live content such as an injection attempt).
+    assert not accepted({
+        "dossierId": "safety-001", "action": "no_action", "target": None,
+        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": "ORD-77"},
+        "evidence": ["o1", "m2"],
+    })
+    print("PASS: no_action requires a recorded case state")
 
     public_key = b"\x01" * 32
 
